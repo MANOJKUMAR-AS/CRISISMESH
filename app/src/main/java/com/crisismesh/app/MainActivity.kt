@@ -43,6 +43,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var messageSpinner: Spinner
     private lateinit var sendSosButton: Button
     private lateinit var scanButton: Button
+    private lateinit var viewMapButton: Button
 
     // =========================================================
     // LOCATION DATA
@@ -179,6 +180,8 @@ class MainActivity : AppCompatActivity() {
                     override fun onStatusChanged(
                         status: String
                     ) {
+
+                        LocationHub.updateMeshStatus(status)
 
                         runOnUiThread {
 
@@ -322,6 +325,8 @@ class MainActivity : AppCompatActivity() {
                                 
                                 ${packet.message}
                                 """.trimIndent()
+
+                            LocationHub.addSosPacket(packet)
 
                             Toast.makeText(
                                 this@MainActivity,
@@ -690,6 +695,34 @@ class MainActivity : AppCompatActivity() {
         }
 
         root.addView(scanButton)
+
+        addSpace(
+            root,
+            12
+        )
+
+        // =====================================================
+        // VIEW MAP
+        // =====================================================
+
+        viewMapButton =
+            Button(this)
+
+        viewMapButton.text =
+            "🗺️  VIEW OFFLINE MAP"
+
+        viewMapButton.setOnClickListener {
+
+            val intent =
+                Intent(
+                    this,
+                    OfflineMapActivity::class.java
+                )
+
+            startActivity(intent)
+        }
+
+        root.addView(viewMapButton)
 
         addSpace(
             root,
@@ -1121,6 +1154,8 @@ class MainActivity : AppCompatActivity() {
                 location.longitude,
                 location.accuracy
             )
+
+        LocationHub.updateLocation(location)
 
         sosStatus.text =
             "GPS acquired — SOS ready"
