@@ -168,18 +168,27 @@ class MainActivity : AppCompatActivity() {
                                 "Bluetooth: $status"
 
                             /*
-                             * Don't enable SEND SOS merely because
-                             * scanning has started.
+                             * The SOS characteristic has been discovered,
+                             * so the BLE connection is actually ready.
                              */
                             if (
                                 status.contains(
-                                    "ready",
+                                    "CrisisMesh connection ready",
+                                    ignoreCase = true
+                                ) ||
+                                status.contains(
+                                    "CrisisMesh ready",
                                     ignoreCase = true
                                 )
                             ) {
 
+                                sendSosButton.isEnabled = true
+
                                 sosStatus.text =
                                     "SOS ready — CrisisMesh peer connected"
+
+                                scanButton.text =
+                                    "CONNECTED TO CRISIS MESH PEER"
                             }
                         }
                     }
@@ -249,8 +258,13 @@ class MainActivity : AppCompatActivity() {
                             sosStatus.text =
                                 "SOS prepared — scan for a nearby device"
 
+                            /*
+                             * A CrisisMesh node is always allowed to
+                             * initiate a new SOS. It does not need an
+                             * existing outgoing BLE connection.
+                             */
                             sendSosButton.isEnabled =
-                                false
+                                true
 
                             scanButton.text =
                                 "SCAN FOR NEARBY DEVICES"
@@ -306,27 +320,12 @@ class MainActivity : AppCompatActivity() {
                                 "Bluetooth: $message"
 
                             /*
-                             * If a BLE connection fails,
-                             * don't leave SEND SOS enabled.
+                             * Keep SEND SOS available even after a
+                             * connection failure. The next SOS attempt
+                             * will automatically search for a peer.
                              */
-                            if (
-                                message.contains(
-                                    "disconnect",
-                                    ignoreCase = true
-                                ) ||
-                                message.contains(
-                                    "connection",
-                                    ignoreCase = true
-                                ) ||
-                                message.contains(
-                                    "not ready",
-                                    ignoreCase = true
-                                )
-                            ) {
-
-                                sendSosButton.isEnabled =
-                                    false
-                            }
+                            sendSosButton.isEnabled =
+                                true
                         }
                     }
                 }
@@ -578,7 +577,7 @@ class MainActivity : AppCompatActivity() {
             "🚨  SEND SOS"
 
         sendSosButton.isEnabled =
-            false
+            true
 
         sendSosButton.setOnClickListener {
 
@@ -605,11 +604,12 @@ class MainActivity : AppCompatActivity() {
         scanButton.setOnClickListener {
 
             /*
-             * Disable SOS while a new connection
-             * is being established.
+             * Keep SEND SOS available. The BluetoothManager
+             * can queue an SOS and establish a connection
+             * automatically if needed.
              */
             sendSosButton.isEnabled =
-                false
+                true
 
             sosStatus.text =
                 "Searching for nearby CrisisMesh devices..."
@@ -1127,10 +1127,12 @@ class MainActivity : AppCompatActivity() {
             """.trimIndent()
 
         /*
-         * Disable button while transmitting.
+         * Keep the button enabled. BluetoothManager will
+         * reject a second simultaneous transmission if
+         * one is already in progress.
          */
         sendSosButton.isEnabled =
-            false
+            true
 
         sosStatus.text =
             "🚨 SOS TRANSMITTING..."
@@ -1208,6 +1210,16 @@ class MainActivity : AppCompatActivity() {
         }
 
         crisisBluetooth.start()
+
+        /*
+         * Every CrisisMesh phone can both send and receive.
+         * SEND SOS does not require a pre-existing connection.
+         */
+        sendSosButton.isEnabled =
+            true
+
+        sosStatus.text =
+            "SOS ready — press SEND SOS"
     }
 
     // =========================================================

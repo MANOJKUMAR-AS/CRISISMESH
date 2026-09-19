@@ -24,11 +24,26 @@ import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelUuid
 import androidx.core.content.ContextCompat
 import java.io.ByteArrayOutputStream
 import java.util.UUID
 
+/**
+ * CrisisMesh peer communication layer.
+ *
+ * Every phone is BOTH:
+ *  1. GATT SERVER -> can receive SOS from another phone.
+ *  2. GATT CLIENT -> can scan/connect and send SOS to another phone.
+ *
+ * We intentionally use a fresh outbound connection for sending instead
+ * of depending on the direction of an existing GATT connection. This
+ * keeps every phone symmetric:
+ *
+ *     A <-> B <-> C <-> D
+ */
 class BluetoothManager(
     private val context: Context,
     private val listener: Listener
@@ -57,8 +72,14 @@ class BluetoothManager(
 
         private const val PACKET_SIZE = 20
         private const val HEADER_SIZE = 4
-        private const val PAYLOAD_SIZE = PACKET_SIZE - HEADER_SIZE
+        private const val PAYLOAD_SIZE =
+            PACKET_SIZE - HEADER_SIZE
+
         private const val MAGIC: Byte = 0x43
+
+        private const val RELAY_DELAY_MS = 600L
+        private const val RETRY_SCAN_DELAY_MS = 1200L
+        private const val MESSAGE_ID_MEMORY_LIMIT = 500
     }
 
     private val androidBluetoothManager =
@@ -69,35 +90,64 @@ class BluetoothManager(
     private val bluetoothAdapter: BluetoothAdapter?
         get() = androidBluetoothManager.adapter
 
-    private var advertiser: BluetoothLeAdvertiser? = null
-    private var scanner: BluetoothLeScanner? = null
+    private val handler =
+        Handler(Looper.getMainLooper())
+
+    // =========================================================
+    // GATT SERVER - RECEIVING SIDE
+    // =========================================================
 
     private var gattServer: BluetoothGattServer? = null
-    private var bluetoothGatt: BluetoothGatt? = null
+    private var advertiser: BluetoothLeAdvertiser? = null
 
+    // =========================================================
+    // GATT CLIENT - SENDING SIDE
+    // =========================================================
+
+    private var bluetoothGatt: BluetoothGatt? = null
     private var remoteSosCharacteristic:
             BluetoothGattCharacteristic? = null
+    private var clientReady = false
 
+    // =========================================================
+    // SCANNING
+    // =========================================================
+
+    private var scanner: BluetoothLeScanner? = null
     private var scanning = false
 
-    private var clientReady = false
-    private var connectedDevice: BluetoothDevice? = null
+    // Do not immediately send a received SOS back to the device
+    // that just gave it to us.
+    private var relayExcludeAddress: String? = null
 
-    private var outgoingChunks: List<ByteArray> =
-        emptyList()
+    // =========================================================
+    // PENDING SEND / RELAY
+    // =========================================================
 
+    private var pendingMeshPacket: String? = null
+
+    // =========================================================
+    // BLE CHUNKING
+    // =========================================================
+
+    private var outgoingChunks: List<ByteArray> = emptyList()
     private var outgoingIndex = 0
+    private var messageCounter = 0
+
+    private var incomingMessage: IncomingMessage? = null
 
     private data class IncomingMessage(
-        val messageId: Int,
+        val wireMessageId: Int,
         val totalPackets: Int,
         val packets: MutableMap<Int, ByteArray>
     )
 
-    private var incomingMessage:
-            IncomingMessage? = null
+    // =========================================================
+    // MESH DEDUPLICATION
+    // =========================================================
 
-    private var messageCounter = 0
+    private val receivedMeshMessageIds =
+        LinkedHashSet<String>()
 
     // =========================================================
     // PERMISSIONS
@@ -164,7 +214,7 @@ class BluetoothManager(
         }
 
         listener.onStatusChanged(
-            "Starting CrisisMesh..."
+            "CrisisMesh node active — SEND + RECEIVE enabled"
         )
 
         startGattServer()
@@ -186,11 +236,9 @@ class BluetoothManager(
             )
 
         if (gattServer == null) {
-
             listener.onError(
                 "Could not start GATT server"
             )
-
             return
         }
 
@@ -200,26 +248,29 @@ class BluetoothManager(
                 BluetoothGattService.SERVICE_TYPE_PRIMARY
             )
 
-        val sosCharacteristic =
+        /*
+         * WRITE is enough for the receiving side:
+         * another phone connects as GATT client and writes
+         * the SOS packets to this characteristic.
+         *
+         * Every phone also runs its own GATT client, so a
+         * different phone can initiate an outbound connection
+         * whenever it needs to send.
+         */
+        val characteristic =
             BluetoothGattCharacteristic(
                 SOS_CHARACTERISTIC_UUID,
-
                 BluetoothGattCharacteristic.PROPERTY_WRITE or
                         BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
-
                 BluetoothGattCharacteristic.PERMISSION_WRITE
             )
 
-        service.addCharacteristic(
-            sosCharacteristic
-        )
+        service.addCharacteristic(characteristic)
 
         val success =
-            gattServer?.addService(service)
-                ?: false
+            gattServer?.addService(service) ?: false
 
         if (!success) {
-
             listener.onError(
                 "Could not add CrisisMesh service"
             )
@@ -230,6 +281,7 @@ class BluetoothManager(
     // GATT SERVER CALLBACK
     // =========================================================
 
+    @SuppressLint("MissingPermission")
     private val gattServerCallback =
         object : BluetoothGattServerCallback() {
 
@@ -282,7 +334,6 @@ class BluetoothManager(
                 }
             }
 
-            @SuppressLint("MissingPermission")
             override fun onCharacteristicWriteRequest(
                 device: BluetoothDevice,
                 requestId: Int,
@@ -297,6 +348,16 @@ class BluetoothManager(
                     characteristic.uuid !=
                     SOS_CHARACTERISTIC_UUID
                 ) {
+
+                    if (responseNeeded) {
+                        gattServer?.sendResponse(
+                            device,
+                            requestId,
+                            BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED,
+                            offset,
+                            null
+                        )
+                    }
                     return
                 }
 
@@ -311,16 +372,20 @@ class BluetoothManager(
                     )
                 }
 
-                processIncomingPacket(value)
+                processIncomingPacket(
+                    packet = value,
+                    sourceAddress = device.address
+                )
             }
         }
 
     // =========================================================
-    // RECEIVE PACKETS
+    // RECEIVE / REASSEMBLE BLE CHUNKS
     // =========================================================
 
     private fun processIncomingPacket(
-        packet: ByteArray
+        packet: ByteArray,
+        sourceAddress: String
     ) {
 
         if (packet.size < HEADER_SIZE) {
@@ -331,31 +396,36 @@ class BluetoothManager(
             return
         }
 
-        val messageId =
+        val wireMessageId =
             packet[1].toInt() and 0xFF
 
         val sequence =
             packet[2].toInt() and 0xFF
 
-        val total =
+        val totalPackets =
             packet[3].toInt() and 0xFF
 
         if (
-            total <= 0 ||
-            sequence >= total
+            totalPackets <= 0 ||
+            sequence >= totalPackets
         ) {
             return
         }
 
+        /*
+         * For this prototype one active incoming transfer is enough.
+         * A later production version can keep separate buffers per
+         * peer/message pair.
+         */
         if (
             incomingMessage == null ||
-            incomingMessage!!.messageId != messageId
+            incomingMessage!!.wireMessageId != wireMessageId
         ) {
 
             incomingMessage =
                 IncomingMessage(
-                    messageId = messageId,
-                    totalPackets = total,
+                    wireMessageId = wireMessageId,
+                    totalPackets = totalPackets,
                     packets = mutableMapOf()
                 )
         }
@@ -370,39 +440,159 @@ class BluetoothManager(
             )
 
         listener.onStatusChanged(
-            "Receiving SOS ${current.packets.size}/$total"
+            "Receiving SOS ${current.packets.size}/$totalPackets"
         )
 
         if (
-            current.packets.size ==
+            current.packets.size !=
             current.totalPackets
         ) {
+            return
+        }
 
-            val output =
-                ByteArrayOutputStream()
+        val output =
+            ByteArrayOutputStream()
 
-            for (
-            i in 0 until current.totalPackets
-            ) {
+        for (
+        index in 0 until current.totalPackets
+        ) {
 
-                val chunk =
-                    current.packets[i]
-                        ?: return
+            val chunk =
+                current.packets[index]
+                    ?: return
 
-                output.write(chunk)
-            }
+            output.write(chunk)
+        }
 
-            val completeMessage =
-                output
-                    .toByteArray()
-                    .toString(Charsets.UTF_8)
+        incomingMessage = null
 
-            incomingMessage = null
+        val completeMessage =
+            output.toByteArray()
+                .toString(Charsets.UTF_8)
+
+        handleCompleteMeshMessage(
+            rawMessage = completeMessage,
+            sourceAddress = sourceAddress
+        )
+    }
+
+    // =========================================================
+    // HANDLE COMPLETE MESH MESSAGE
+    // =========================================================
+
+    private fun handleCompleteMeshMessage(
+        rawMessage: String,
+        sourceAddress: String
+    ) {
+
+        val meshPacket =
+            MeshPacket.parse(rawMessage)
+
+        /*
+         * Legacy messages are still displayed so the old
+         * A -> B prototype remains compatible.
+         */
+        if (meshPacket == null) {
 
             listener.onMessageReceived(
-                completeMessage
+                rawMessage
             )
+
+            return
         }
+
+        val messageId =
+            meshPacket.messageId
+
+        synchronized(receivedMeshMessageIds) {
+
+            if (
+                receivedMeshMessageIds.contains(
+                    messageId
+                )
+            ) {
+
+                listener.onStatusChanged(
+                    "Duplicate SOS ignored: $messageId"
+                )
+
+                return
+            }
+
+            receivedMeshMessageIds.add(
+                messageId
+            )
+
+            while (
+                receivedMeshMessageIds.size >
+                MESSAGE_ID_MEMORY_LIMIT
+            ) {
+                val first =
+                    receivedMeshMessageIds.firstOrNull()
+
+                if (first != null) {
+                    receivedMeshMessageIds.remove(first)
+                } else {
+                    break
+                }
+            }
+        }
+
+        listener.onStatusChanged(
+            "SOS $messageId received"
+        )
+
+        /*
+         * Always show the emergency information on this device.
+         */
+        listener.onMessageReceived(
+            meshPacket.message
+        )
+
+        /*
+         * TTL decides whether this node may forward the SOS.
+         */
+        if (!meshPacket.canRelay()) {
+
+            listener.onStatusChanged(
+                "SOS $messageId stopped — TTL exhausted"
+            )
+
+            return
+        }
+
+        val relayPacket =
+            meshPacket.createRelayPacket()
+
+        if (!relayPacket.canRelay()) {
+
+            listener.onStatusChanged(
+                "SOS $messageId stopped — no relay hops remaining"
+            )
+
+            return
+        }
+
+        pendingMeshPacket =
+            relayPacket.serialize()
+
+        /*
+         * Don't immediately send the message back to the
+         * phone that just delivered it to us.
+         */
+        relayExcludeAddress =
+            sourceAddress
+
+        listener.onStatusChanged(
+            "SOS $messageId queued for automatic relay"
+        )
+
+        handler.postDelayed(
+            {
+                attemptPendingRelay()
+            },
+            RELAY_DELAY_MS
+        )
     }
 
     // =========================================================
@@ -426,11 +616,9 @@ class BluetoothManager(
         }
 
         if (!adapter.isMultipleAdvertisementSupported) {
-
             listener.onError(
                 "BLE advertising not supported"
             )
-
             return
         }
 
@@ -438,11 +626,9 @@ class BluetoothManager(
             adapter.bluetoothLeAdvertiser
 
         if (advertiser == null) {
-
             listener.onError(
                 "BLE advertiser unavailable"
             )
-
             return
         }
 
@@ -459,17 +645,34 @@ class BluetoothManager(
 
         val data =
             AdvertiseData.Builder()
-                .setIncludeDeviceName(true)
+                .setIncludeDeviceName(false)
                 .addServiceUuid(
                     ParcelUuid(SERVICE_UUID)
                 )
                 .build()
 
-        advertiser?.startAdvertising(
-            settings,
-            data,
-            advertiseCallback
-        )
+        val scanResponse =
+            AdvertiseData.Builder()
+                .setIncludeDeviceName(true)
+                .build()
+
+        try {
+
+            advertiser?.startAdvertising(
+                settings,
+                data,
+                scanResponse,
+                advertiseCallback
+            )
+
+        } catch (
+            error: Exception
+        ) {
+
+            listener.onError(
+                "Advertising exception: ${error.message}"
+            )
+        }
     }
 
     private val advertiseCallback =
@@ -495,18 +698,97 @@ class BluetoothManager(
         }
 
     // =========================================================
-    // SCANNING
+    // MANUAL SCAN
     // =========================================================
 
     @SuppressLint("MissingPermission")
     fun startScan() {
 
-        if (!hasBluetoothPermissions()) {
+        /*
+         * Manual scan is allowed to choose any peer.
+         */
+        relayExcludeAddress = null
 
+        startScanInternal(
+            "Scanning for CrisisMesh peers..."
+        )
+    }
+
+    // =========================================================
+    // AUTOMATIC RELAY / QUEUED SEND
+    // =========================================================
+
+    private fun attemptPendingRelay() {
+
+        val packet =
+            pendingMeshPacket
+
+        if (packet == null) {
+            return
+        }
+
+        /*
+         * A pending packet may be sent immediately if there is
+         * already a ready outgoing connection and it is not the
+         * source peer.
+         */
+        val currentClientAddress =
+            bluetoothGatt?.device?.address
+
+        if (
+            clientReady &&
+            bluetoothGatt != null &&
+            remoteSosCharacteristic != null &&
+            currentClientAddress != null &&
+            currentClientAddress != relayExcludeAddress
+        ) {
+
+            pendingMeshPacket = null
+
+            listener.onStatusChanged(
+                "Relaying SOS through connected peer..."
+            )
+
+            sendMeshPacket(packet)
+
+            return
+        }
+
+        /*
+         * Otherwise discover a new peer automatically.
+         */
+        startRelayScan()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startRelayScan() {
+
+        if (pendingMeshPacket == null) {
+            return
+        }
+
+        listener.onStatusChanged(
+            "Searching for next CrisisMesh peer..."
+        )
+
+        startScanInternal(
+            "Searching for next relay peer..."
+        )
+    }
+
+    // =========================================================
+    // INTERNAL SCANNER
+    // =========================================================
+
+    @SuppressLint("MissingPermission")
+    private fun startScanInternal(
+        statusMessage: String
+    ) {
+
+        if (!hasBluetoothPermissions()) {
             listener.onError(
                 "Bluetooth permissions not granted"
             )
-
             return
         }
 
@@ -516,38 +798,36 @@ class BluetoothManager(
             adapter == null ||
             !adapter.isEnabled
         ) {
-
             listener.onError(
                 "Bluetooth is OFF"
             )
+            return
+        }
 
+        if (scanning) {
             return
         }
 
         /*
-         * Always clean up an old outgoing connection
-         * before starting a new scan.
+         * Don't start a new scan if we are already in the process
+         * of connecting to a peer.
          */
-        disconnectClient()
-
-        if (scanning) {
-            stopScan()
+        if (bluetoothGatt != null && !clientReady) {
+            return
         }
 
         scanner =
             adapter.bluetoothLeScanner
 
         if (scanner == null) {
-
             listener.onError(
                 "BLE scanner unavailable"
             )
-
             return
         }
 
         listener.onStatusChanged(
-            "Scanning for CrisisMesh peers..."
+            statusMessage
         )
 
         val filter =
@@ -566,17 +846,34 @@ class BluetoothManager(
 
         scanning = true
 
-        scanner?.startScan(
-            listOf(filter),
-            settings,
-            scanCallback
-        )
+        try {
+
+            scanner?.startScan(
+                listOf(filter),
+                settings,
+                scanCallback
+            )
+
+        } catch (
+            error: Exception
+        ) {
+
+            scanning = false
+
+            listener.onError(
+                "Scan exception: ${error.message}"
+            )
+        }
     }
 
+    // =========================================================
+    // SCAN CALLBACK
+    // =========================================================
+
+    @SuppressLint("MissingPermission")
     private val scanCallback =
         object : ScanCallback() {
 
-            @SuppressLint("MissingPermission")
             override fun onScanResult(
                 callbackType: Int,
                 result: ScanResult
@@ -585,10 +882,23 @@ class BluetoothManager(
                 val device =
                     result.device
 
+                /*
+                 * For automatic relay, don't immediately return
+                 * the SOS to the peer that just sent it.
+                 */
+                if (
+                    relayExcludeAddress != null &&
+                    device.address == relayExcludeAddress
+                ) {
+                    return
+                }
+
                 val name =
                     safeDeviceName(device)
 
-                listener.onDeviceFound(name)
+                listener.onDeviceFound(
+                    name
+                )
 
                 stopScan()
 
@@ -604,8 +914,22 @@ class BluetoothManager(
                 listener.onError(
                     "Scan failed: $errorCode"
                 )
+
+                if (pendingMeshPacket != null) {
+
+                    handler.postDelayed(
+                        {
+                            attemptPendingRelay()
+                        },
+                        RETRY_SCAN_DELAY_MS
+                    )
+                }
             }
         }
+
+    // =========================================================
+    // STOP SCAN
+    // =========================================================
 
     @SuppressLint("MissingPermission")
     private fun stopScan() {
@@ -614,15 +938,18 @@ class BluetoothManager(
             return
         }
 
-        scanner?.stopScan(
-            scanCallback
-        )
+        try {
+            scanner?.stopScan(
+                scanCallback
+            )
+        } catch (_: Exception) {
+        }
 
         scanning = false
     }
 
     // =========================================================
-    // CONNECT
+    // CONNECT OUTBOUND
     // =========================================================
 
     @SuppressLint("MissingPermission")
@@ -630,34 +957,61 @@ class BluetoothManager(
         device: BluetoothDevice
     ) {
 
-        disconnectClient()
+        if (
+            relayExcludeAddress != null &&
+            device.address == relayExcludeAddress
+        ) {
+            return
+        }
 
+        bluetoothGatt?.disconnect()
+        bluetoothGatt?.close()
+
+        bluetoothGatt = null
         remoteSosCharacteristic = null
         clientReady = false
-
-        connectedDevice = device
 
         listener.onStatusChanged(
             "Connecting to ${safeDeviceName(device)}..."
         )
 
-        bluetoothGatt =
-            device.connectGatt(
-                context,
-                false,
-                gattCallback,
-                BluetoothDevice.TRANSPORT_LE
+        try {
+
+            bluetoothGatt =
+                device.connectGatt(
+                    context,
+                    false,
+                    gattCallback,
+                    BluetoothDevice.TRANSPORT_LE
+                )
+
+        } catch (
+            error: Exception
+        ) {
+
+            listener.onError(
+                "Connection exception: ${error.message}"
             )
+
+            if (pendingMeshPacket != null) {
+                handler.postDelayed(
+                    {
+                        attemptPendingRelay()
+                    },
+                    RETRY_SCAN_DELAY_MS
+                )
+            }
+        }
     }
 
     // =========================================================
     // GATT CLIENT CALLBACK
     // =========================================================
 
+    @SuppressLint("MissingPermission")
     private val gattCallback =
         object : BluetoothGattCallback() {
 
-            @SuppressLint("MissingPermission")
             override fun onConnectionStateChange(
                 gatt: BluetoothGatt,
                 status: Int,
@@ -666,19 +1020,24 @@ class BluetoothManager(
 
                 if (
                     status == BluetoothGatt.GATT_SUCCESS &&
-                    newState ==
-                    BluetoothProfile.STATE_CONNECTED
+                    newState == BluetoothProfile.STATE_CONNECTED
                 ) {
 
                     listener.onStatusChanged(
                         "Connected — discovering CrisisMesh service..."
                     )
 
+                    try {
+
+                        gatt.requestMtu(517)
+
+                    } catch (_: Exception) {
+                    }
+
                     gatt.discoverServices()
 
                 } else if (
-                    newState ==
-                    BluetoothProfile.STATE_DISCONNECTED
+                    newState == BluetoothProfile.STATE_DISCONNECTED
                 ) {
 
                     clientReady = false
@@ -686,16 +1045,27 @@ class BluetoothManager(
 
                     listener.onDisconnected()
 
-                    listener.onError(
-                        "Disconnected. GATT status: $status"
-                    )
+                    try {
+                        gatt.close()
+                    } catch (_: Exception) {
+                    }
 
-                    gatt.close()
-
-                    if (
-                        bluetoothGatt === gatt
-                    ) {
+                    if (bluetoothGatt === gatt) {
                         bluetoothGatt = null
+                    }
+
+                    if (pendingMeshPacket != null) {
+
+                        listener.onStatusChanged(
+                            "Peer connection lost — retrying relay"
+                        )
+
+                        handler.postDelayed(
+                            {
+                                attemptPendingRelay()
+                            },
+                            RETRY_SCAN_DELAY_MS
+                        )
                     }
                 }
             }
@@ -706,8 +1076,7 @@ class BluetoothManager(
             ) {
 
                 if (
-                    status !=
-                    BluetoothGatt.GATT_SUCCESS
+                    status != BluetoothGatt.GATT_SUCCESS
                 ) {
 
                     listener.onError(
@@ -751,14 +1120,48 @@ class BluetoothManager(
                 clientReady = true
 
                 listener.onStatusChanged(
-                    "CrisisMesh ready — bidirectional SOS enabled"
+                    "CrisisMesh connection ready"
                 )
 
                 listener.onConnected(
-                    connectedDevice?.let {
-                        safeDeviceName(it)
-                    } ?: "CrisisMesh peer"
+                    "CrisisMesh peer"
                 )
+
+                /*
+                 * If a message was waiting for this connection,
+                 * send it immediately.
+                 */
+                val pending =
+                    pendingMeshPacket
+
+                if (pending != null) {
+
+                    pendingMeshPacket = null
+
+                    listener.onStatusChanged(
+                        "Sending queued SOS to peer..."
+                    )
+
+                    sendMeshPacket(
+                        pending
+                    )
+                }
+            }
+
+            override fun onMtuChanged(
+                gatt: BluetoothGatt,
+                mtu: Int,
+                status: Int
+            ) {
+
+                if (
+                    status == BluetoothGatt.GATT_SUCCESS
+                ) {
+
+                    listener.onStatusChanged(
+                        "BLE MTU negotiated: $mtu"
+                    )
+                }
             }
 
             override fun onCharacteristicWrite(
@@ -767,41 +1170,38 @@ class BluetoothManager(
                 status: Int
             ) {
 
+                if (!clientReady) {
+                    return
+                }
+
                 if (
-                    status ==
-                    BluetoothGatt.GATT_SUCCESS
+                    status != BluetoothGatt.GATT_SUCCESS
                 ) {
 
-                    outgoingIndex++
-
-                    if (
-                        outgoingIndex <
-                        outgoingChunks.size
-                    ) {
-
-                        writeNextChunk()
-
-                    } else {
-
-                        outgoingChunks =
-                            emptyList()
-
-                        outgoingIndex = 0
-
-                        listener.onStatusChanged(
-                            "SOS transmitted successfully"
-                        )
-                    }
-
-                } else {
-
-                    outgoingChunks =
-                        emptyList()
-
-                    outgoingIndex = 0
+                    clearOutgoingState()
 
                     listener.onError(
                         "SOS packet failed: $status"
+                    )
+
+                    return
+                }
+
+                outgoingIndex++
+
+                if (
+                    outgoingIndex <
+                    outgoingChunks.size
+                ) {
+
+                    writeNextChunk()
+
+                } else {
+
+                    clearOutgoingState()
+
+                    listener.onStatusChanged(
+                        "SOS transmitted successfully"
                     )
                 }
             }
@@ -815,14 +1215,64 @@ class BluetoothManager(
         message: String
     ) {
 
-        if (!clientReady) {
+        val meshPacket =
+            MeshPacket.create(
+                message
+            )
 
-            listener.onError(
-                "CrisisMesh connection is not ready"
+        synchronized(receivedMeshMessageIds) {
+            receivedMeshMessageIds.add(
+                meshPacket.messageId
+            )
+        }
+
+        val serialized =
+            meshPacket.serialize()
+
+        listener.onStatusChanged(
+            "Created SOS ${meshPacket.messageId}"
+        )
+
+        /*
+         * If this phone already has a usable outbound
+         * client connection, send immediately.
+         */
+        if (
+            clientReady &&
+            bluetoothGatt != null &&
+            remoteSosCharacteristic != null
+        ) {
+
+            sendMeshPacket(
+                serialized
             )
 
             return
         }
+
+        /*
+         * Otherwise queue the SOS and discover a peer.
+         */
+        pendingMeshPacket =
+            serialized
+
+        relayExcludeAddress = null
+
+        listener.onStatusChanged(
+            "No outbound peer yet — automatically searching..."
+        )
+
+        startRelayScan()
+    }
+
+    // =========================================================
+    // SEND MESH PACKET
+    // =========================================================
+
+    @SuppressLint("MissingPermission")
+    private fun sendMeshPacket(
+        meshMessage: String
+    ) {
 
         val gatt =
             bluetoothGatt
@@ -832,58 +1282,66 @@ class BluetoothManager(
 
         if (
             gatt == null ||
-            characteristic == null
+            characteristic == null ||
+            !clientReady
         ) {
 
-            listener.onError(
-                "CrisisMesh connection is not ready"
+            pendingMeshPacket =
+                meshMessage
+
+            clearOutgoingState()
+
+            listener.onStatusChanged(
+                "Outbound connection not ready — searching again..."
             )
+
+            startRelayScan()
 
             return
         }
 
-        if (
-            outgoingChunks.isNotEmpty()
-        ) {
+        if (outgoingChunks.isNotEmpty()) {
 
             listener.onError(
                 "Another SOS is currently transmitting"
             )
 
+            if (pendingMeshPacket == null) {
+                pendingMeshPacket = meshMessage
+            }
+
             return
         }
 
-        val messageBytes =
-            message.toByteArray(
+        val bytes =
+            meshMessage.toByteArray(
                 Charsets.UTF_8
             )
 
-        if (messageBytes.isEmpty()) {
+        if (bytes.isEmpty()) {
 
             listener.onError(
-                "SOS message is empty"
+                "Mesh packet is empty"
             )
 
             return
         }
 
-        messageCounter =
+        val nextCounter =
             (messageCounter + 1) and 0xFF
 
-        if (messageCounter == 0) {
-            messageCounter = 1
-        }
+        messageCounter =
+            if (nextCounter == 0) 1 else nextCounter
 
         val totalPackets =
             (
-                    messageBytes.size +
-                            PAYLOAD_SIZE - 1
+                    bytes.size + PAYLOAD_SIZE - 1
                     ) / PAYLOAD_SIZE
 
         if (totalPackets > 255) {
 
             listener.onError(
-                "SOS message is too large"
+                "Mesh message is too large"
             )
 
             return
@@ -902,32 +1360,24 @@ class BluetoothManager(
             val end =
                 minOf(
                     start + PAYLOAD_SIZE,
-                    messageBytes.size
+                    bytes.size
                 )
 
             val payload =
-                messageBytes.copyOfRange(
+                bytes.copyOfRange(
                     start,
                     end
                 )
 
             val packet =
                 ByteArray(
-                    HEADER_SIZE +
-                            payload.size
+                    HEADER_SIZE + payload.size
                 )
 
-            packet[0] =
-                MAGIC
-
-            packet[1] =
-                messageCounter.toByte()
-
-            packet[2] =
-                sequence.toByte()
-
-            packet[3] =
-                totalPackets.toByte()
+            packet[0] = MAGIC
+            packet[1] = messageCounter.toByte()
+            packet[2] = sequence.toByte()
+            packet[3] = totalPackets.toByte()
 
             System.arraycopy(
                 payload,
@@ -951,11 +1401,18 @@ class BluetoothManager(
     }
 
     // =========================================================
-    // WRITE PACKET
+    // WRITE NEXT CHUNK
     // =========================================================
 
     @SuppressLint("MissingPermission")
     private fun writeNextChunk() {
+
+        if (
+            outgoingIndex >=
+            outgoingChunks.size
+        ) {
+            return
+        }
 
         val gatt =
             bluetoothGatt
@@ -969,22 +1426,19 @@ class BluetoothManager(
             !clientReady
         ) {
 
-            outgoingChunks =
-                emptyList()
+            val unsent =
+                buildString {
+                    // We cannot reconstruct by chunk safely here,
+                    // so just fail this transmission and let the
+                    // caller retry the original packet on the next send.
+                }
 
-            outgoingIndex = 0
+            clearOutgoingState()
 
             listener.onError(
                 "Connection lost while sending SOS"
             )
 
-            return
-        }
-
-        if (
-            outgoingIndex >=
-            outgoingChunks.size
-        ) {
             return
         }
 
@@ -994,9 +1448,7 @@ class BluetoothManager(
             ]
 
         listener.onStatusChanged(
-            "Sending SOS ${
-                outgoingIndex + 1
-            }/${outgoingChunks.size}..."
+            "Sending SOS ${outgoingIndex + 1}/${outgoingChunks.size}..."
         )
 
         if (
@@ -1008,7 +1460,7 @@ class BluetoothManager(
                 gatt.writeCharacteristic(
                     characteristic,
                     packet,
-                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
                 )
 
             if (
@@ -1016,10 +1468,7 @@ class BluetoothManager(
                 android.bluetooth.BluetoothStatusCodes.SUCCESS
             ) {
 
-                outgoingChunks =
-                    emptyList()
-
-                outgoingIndex = 0
+                clearOutgoingState()
 
                 listener.onError(
                     "Could not send SOS packet: $result"
@@ -1029,12 +1478,13 @@ class BluetoothManager(
         } else {
 
             @Suppress("DEPRECATION")
-
-            characteristic.value =
-                packet
+            characteristic.value = packet
 
             @Suppress("DEPRECATION")
+            characteristic.writeType =
+                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
 
+            @Suppress("DEPRECATION")
             val success =
                 gatt.writeCharacteristic(
                     characteristic
@@ -1042,10 +1492,7 @@ class BluetoothManager(
 
             if (!success) {
 
-                outgoingChunks =
-                    emptyList()
-
-                outgoingIndex = 0
+                clearOutgoingState()
 
                 listener.onError(
                     "Could not send SOS packet"
@@ -1055,38 +1502,7 @@ class BluetoothManager(
     }
 
     // =========================================================
-    // DISCONNECT CLIENT
-    // =========================================================
-
-    @SuppressLint("MissingPermission")
-    private fun disconnectClient() {
-
-        bluetoothGatt?.let { gatt ->
-
-            try {
-                gatt.disconnect()
-            } catch (_: Exception) {
-            }
-
-            try {
-                gatt.close()
-            } catch (_: Exception) {
-            }
-        }
-
-        bluetoothGatt = null
-        remoteSosCharacteristic = null
-        connectedDevice = null
-        clientReady = false
-
-        outgoingChunks =
-            emptyList()
-
-        outgoingIndex = 0
-    }
-
-    // =========================================================
-    // DEVICE NAME
+    // HELPERS
     // =========================================================
 
     @SuppressLint("MissingPermission")
@@ -1095,16 +1511,16 @@ class BluetoothManager(
     ): String {
 
         return try {
-
-            device.name
-                ?: "CrisisMesh device"
-
-        } catch (
-            _: SecurityException
-        ) {
-
+            device.name ?: "CrisisMesh device"
+        } catch (_: SecurityException) {
             "CrisisMesh device"
         }
+    }
+
+    private fun clearOutgoingState() {
+
+        outgoingChunks = emptyList()
+        outgoingIndex = 0
     }
 
     // =========================================================
@@ -1116,6 +1532,8 @@ class BluetoothManager(
 
         stopScan()
 
+        handler.removeCallbacksAndMessages(null)
+
         try {
             advertiser?.stopAdvertising(
                 advertiseCallback
@@ -1125,12 +1543,32 @@ class BluetoothManager(
 
         advertiser = null
 
-        disconnectClient()
+        try {
+            bluetoothGatt?.disconnect()
+            bluetoothGatt?.close()
+        } catch (_: Exception) {
+        }
 
-        gattServer?.close()
+        bluetoothGatt = null
+        remoteSosCharacteristic = null
+        clientReady = false
+
+        try {
+            gattServer?.close()
+        } catch (_: Exception) {
+        }
 
         gattServer = null
+        scanner = null
 
+        pendingMeshPacket = null
+        relayExcludeAddress = null
         incomingMessage = null
+
+        clearOutgoingState()
+
+        synchronized(receivedMeshMessageIds) {
+            receivedMeshMessageIds.clear()
+        }
     }
 }
