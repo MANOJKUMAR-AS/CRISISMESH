@@ -1,19 +1,23 @@
 package com.crisismesh.app
 
 import android.Manifest
+import android.R
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager as AndroidBluetoothManager
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.location.Location
 import android.location.LocationManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Space
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -36,6 +40,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var sosStatus: TextView
     private lateinit var receivedMessage: TextView
 
+    private lateinit var messageSpinner: Spinner
     private lateinit var sendSosButton: Button
     private lateinit var scanButton: Button
 
@@ -46,6 +51,19 @@ class MainActivity : AppCompatActivity() {
     private var currentLatitude: Double? = null
     private var currentLongitude: Double? = null
     private var currentAccuracy: Float? = null
+
+    private val predefinedMessages = arrayOf(
+        "Select Emergency Message",
+        "🚨 Medical Emergency",
+        "🆘 Person Trapped",
+        "🔥 Fire Emergency",
+        "💧 Need Water",
+        "🍱 Need Food",
+        "💊 Need Medicine",
+        "👥 Need Rescue Team",
+        "📍 Need Evacuation",
+        "⚠️ General Emergency"
+    )
 
     // =========================================================
     // BLUETOOTH PERMISSION LAUNCHER
@@ -276,7 +294,7 @@ class MainActivity : AppCompatActivity() {
                     // =================================================
 
                     override fun onMessageReceived(
-                        message: String
+                        packet: MeshPacket
                     ) {
 
                         runOnUiThread {
@@ -296,11 +314,18 @@ class MainActivity : AppCompatActivity() {
                                 )
 
                             receivedMessage.text =
-                                "Received at $time\n\n$message"
+                                """
+                                From: ${packet.originDeviceId}
+                                SOS ID: ${packet.messageId}
+                                Hops: ${packet.hopCount}
+                                Time: $time
+                                
+                                ${packet.message}
+                                """.trimIndent()
 
                             Toast.makeText(
                                 this@MainActivity,
-                                "🚨 SOS RECEIVED",
+                                "🚨 SOS RECEIVED from ${packet.originDeviceId}",
                                 Toast.LENGTH_LONG
                             ).show()
                         }
@@ -563,7 +588,54 @@ class MainActivity : AppCompatActivity() {
 
         addSpace(
             root,
-            8
+            12
+        )
+
+        // =====================================================
+        // PREDEFINED MESSAGES
+        // =====================================================
+
+        val spinnerTitle =
+            TextView(this)
+
+        spinnerTitle.text =
+            "SELECT MESSAGE"
+
+        spinnerTitle.textSize =
+            14f
+
+        spinnerTitle.setTextColor(
+            Color.LTGRAY
+        )
+
+        root.addView(spinnerTitle)
+
+        messageSpinner =
+            Spinner(this)
+
+        val adapter =
+            ArrayAdapter(
+                this,
+                R.layout.simple_spinner_item,
+                predefinedMessages
+            )
+
+        adapter.setDropDownViewResource(
+            R.layout.simple_spinner_dropdown_item
+        )
+
+        messageSpinner.adapter =
+            adapter
+
+        messageSpinner.setBackgroundColor(
+            Color.WHITE
+        )
+
+        root.addView(messageSpinner)
+
+        addSpace(
+            root,
+            12
         )
 
         // =====================================================
@@ -1060,6 +1132,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun sendSOS() {
 
+        val selectedMessage =
+            messageSpinner.selectedItem.toString()
+
+        val emergencyPrefix =
+            if (
+                selectedMessage ==
+                predefinedMessages[0]
+            ) {
+                "🚨 CRISIS MESH SOS"
+            } else {
+                selectedMessage
+            }
+
         val time =
             SimpleDateFormat(
                 "yyyy-MM-dd HH:mm:ss",
@@ -1109,7 +1194,7 @@ class MainActivity : AppCompatActivity() {
 
         val message =
             """
-            🚨 CRISIS MESH SOS
+            $emergencyPrefix
             
             Emergency assistance required.
             

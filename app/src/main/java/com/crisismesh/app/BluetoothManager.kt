@@ -54,7 +54,7 @@ class BluetoothManager(
         fun onDeviceFound(deviceName: String)
         fun onConnected(deviceName: String)
         fun onDisconnected()
-        fun onMessageReceived(message: String)
+        fun onMessageReceived(packet: MeshPacket)
         fun onError(message: String)
     }
 
@@ -119,6 +119,9 @@ class BluetoothManager(
     // Do not immediately send a received SOS back to the device
     // that just gave it to us.
     private var relayExcludeAddress: String? = null
+
+    // Do not send the SOS back to the original sender if we discover it.
+    private var pendingOriginDeviceId: String? = null
 
     // =========================================================
     // PENDING SEND / RELAY
@@ -495,7 +498,7 @@ class BluetoothManager(
         if (meshPacket == null) {
 
             listener.onMessageReceived(
-                rawMessage
+                MeshPacket.create(rawMessage)
             )
 
             return
@@ -546,7 +549,7 @@ class BluetoothManager(
          * Always show the emergency information on this device.
          */
         listener.onMessageReceived(
-            meshPacket.message
+            meshPacket
         )
 
         /*
@@ -575,6 +578,9 @@ class BluetoothManager(
 
         pendingMeshPacket =
             relayPacket.serialize()
+
+        pendingOriginDeviceId =
+            meshPacket.originDeviceId
 
         /*
          * Don't immediately send the message back to the
@@ -895,6 +901,16 @@ class BluetoothManager(
 
                 val name =
                     safeDeviceName(device)
+
+                /*
+                 * Prevent relaying back to the original sender.
+                 */
+                if (
+                    pendingOriginDeviceId != null &&
+                    name == pendingOriginDeviceId
+                ) {
+                    return
+                }
 
                 listener.onDeviceFound(
                     name
@@ -1257,6 +1273,7 @@ class BluetoothManager(
             serialized
 
         relayExcludeAddress = null
+        pendingOriginDeviceId = null
 
         listener.onStatusChanged(
             "No outbound peer yet — automatically searching..."
@@ -1562,6 +1579,7 @@ class BluetoothManager(
         scanner = null
 
         pendingMeshPacket = null
+        pendingOriginDeviceId = null
         relayExcludeAddress = null
         incomingMessage = null
 
