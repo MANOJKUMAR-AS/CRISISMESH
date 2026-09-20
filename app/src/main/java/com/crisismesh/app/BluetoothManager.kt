@@ -27,6 +27,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
+import android.util.Log
 import androidx.core.content.ContextCompat
 import java.io.ByteArrayOutputStream
 import java.util.UUID
@@ -519,12 +520,17 @@ class BluetoothManager(
                     "Duplicate SOS ignored: $messageId"
                 )
 
+                Log.d("CRISIS_MESH_SOUND", "Duplicate message, buzzer suppressed: $messageId")
+
                 return
             }
 
             receivedMeshMessageIds.add(
                 messageId
             )
+
+            Log.d("CRISIS_MESH_SOUND", "Playing emergency alert for messageId=$messageId")
+            EmergencyAlertSound.play()
 
             while (
                 receivedMeshMessageIds.size >
