@@ -53,6 +53,7 @@
         android:allowBackup="true"
         android:label="CrisisMesh"
         android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
         android:theme="@style/Theme.AppCompat.Light.NoActionBar">
 
         <!-- Main Activity -->

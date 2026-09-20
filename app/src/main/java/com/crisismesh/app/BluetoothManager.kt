@@ -1230,11 +1230,13 @@ class BluetoothManager(
     fun sendSOS(
         message: String
     ) {
+        val meshPacket = MeshPacket.create(message)
+        sendSOS(meshPacket)
+    }
 
-        val meshPacket =
-            MeshPacket.create(
-                message
-            )
+    fun sendSOS(
+        meshPacket: MeshPacket
+    ) {
 
         synchronized(receivedMeshMessageIds) {
             receivedMeshMessageIds.add(

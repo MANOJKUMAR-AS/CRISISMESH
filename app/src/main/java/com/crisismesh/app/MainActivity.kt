@@ -12,8 +12,12 @@ import android.location.LocationManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.util.Log
+import android.view.View
+import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Space
@@ -21,6 +25,7 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import java.text.SimpleDateFormat
@@ -30,6 +35,7 @@ import java.util.Locale
 class MainActivity : AppCompatActivity() {
 
     private lateinit var crisisBluetooth: BluetoothManager
+    private lateinit var gatewayUploader: GatewayUploader
 
     // =========================================================
     // UI COMPONENTS
@@ -37,7 +43,9 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var bluetoothStatus: TextView
     private lateinit var locationStatus: TextView
+    private lateinit var cloudStatus: TextView
     private lateinit var sosStatus: TextView
+    private lateinit var customMessageInput: EditText
     private lateinit var receivedMessage: TextView
 
     private lateinit var messageSpinner: Spinner
@@ -63,7 +71,8 @@ class MainActivity : AppCompatActivity() {
         "💊 Need Medicine",
         "👥 Need Rescue Team",
         "📍 Need Evacuation",
-        "⚠️ General Emergency"
+        "⚠️ General Emergency",
+        "📝 Custom Message"
     )
 
     // =========================================================
@@ -162,6 +171,18 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         createUI()
+
+        // -----------------------------------------------------
+        // CREATE GATEWAY UPLOADER
+        // -----------------------------------------------------
+        
+        gatewayUploader = GatewayUploader(this, object : GatewayUploader.Listener {
+            override fun onUploadStatusChanged(message: String) {
+                runOnUiThread {
+                    cloudStatus.text = message
+                }
+            }
+        })
 
         // -----------------------------------------------------
         // CREATE BLUETOOTH MANAGER
@@ -327,6 +348,7 @@ class MainActivity : AppCompatActivity() {
                                 """.trimIndent()
 
                             LocationHub.addSosPacket(packet)
+                            gatewayUploader.processPacket(packet)
 
                             Toast.makeText(
                                 this@MainActivity,
@@ -480,6 +502,25 @@ class MainActivity : AppCompatActivity() {
         )
 
         root.addView(networkStatus)
+
+        // =====================================================
+        // CLOUD STATUS
+        // =====================================================
+
+        cloudStatus =
+            TextView(this)
+
+        cloudStatus.text =
+            "☁️ Server: Waiting..."
+
+        cloudStatus.textSize =
+            18f
+
+        cloudStatus.setTextColor(
+            Color.WHITE
+        )
+
+        root.addView(cloudStatus)
 
         // =====================================================
         // BLUETOOTH
@@ -637,6 +678,34 @@ class MainActivity : AppCompatActivity() {
         )
 
         root.addView(messageSpinner)
+
+        addSpace(
+            root,
+            12
+        )
+
+        // =====================================================
+        // CUSTOM MESSAGE INPUT
+        // =====================================================
+
+        customMessageInput = EditText(this)
+        customMessageInput.hint = "Type your custom message here..."
+        customMessageInput.setTextColor(Color.WHITE)
+        customMessageInput.setHintTextColor(Color.GRAY)
+        customMessageInput.visibility = View.GONE
+        root.addView(customMessageInput)
+
+        messageSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (predefinedMessages[position] == "📝 Custom Message") {
+                    customMessageInput.visibility = View.VISIBLE
+                } else {
+                    customMessageInput.visibility = View.GONE
+                }
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
 
         addSpace(
             root,
@@ -1166,12 +1235,14 @@ class MainActivity : AppCompatActivity() {
     // =========================================================
 
     private fun sendSOS() {
-
+        Log.d("MainActivity", "Send SOS button clicked")
         val selectedMessage =
             messageSpinner.selectedItem.toString()
 
         val emergencyPrefix =
-            if (
+            if (selectedMessage == "📝 Custom Message") {
+                customMessageInput.text.toString().ifBlank { "🚨 CUSTOM SOS" }
+            } else if (
                 selectedMessage ==
                 predefinedMessages[0]
             ) {
@@ -1246,6 +1317,11 @@ class MainActivity : AppCompatActivity() {
             Priority: HIGH
             """.trimIndent()
 
+        if (currentLatitude == null || currentLongitude == null) {
+            Toast.makeText(this, "Acquire GPS location before sending SOS", Toast.LENGTH_SHORT).show()
+            return
+        }
+
         /*
          * Keep the button enabled. BluetoothManager will
          * reject a second simultaneous transmission if
@@ -1257,8 +1333,11 @@ class MainActivity : AppCompatActivity() {
         sosStatus.text =
             "🚨 SOS TRANSMITTING..."
 
+        val meshPacket = MeshPacket.create(message)
+        gatewayUploader.processPacket(meshPacket)
+
         crisisBluetooth.sendSOS(
-            message
+            meshPacket
         )
     }
 
