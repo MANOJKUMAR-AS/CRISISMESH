@@ -52,6 +52,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var sendSosButton: Button
     private lateinit var scanButton: Button
     private lateinit var viewMapButton: Button
+    private lateinit var viewSenderMapButton: Button
 
     // =========================================================
     // LOCATION DATA
@@ -60,6 +61,7 @@ class MainActivity : AppCompatActivity() {
     private var currentLatitude: Double? = null
     private var currentLongitude: Double? = null
     private var currentAccuracy: Float? = null
+    private var latestReceivedPacket: MeshPacket? = null
 
     private val predefinedMessages = arrayOf(
         "Select Emergency Message",
@@ -346,6 +348,9 @@ class MainActivity : AppCompatActivity() {
                                 
                                 ${packet.message}
                                 """.trimIndent()
+
+                            latestReceivedPacket = packet
+                            viewSenderMapButton.visibility = View.VISIBLE
 
                             LocationHub.addSosPacket(packet)
                             gatewayUploader.processPacket(packet)
@@ -851,6 +856,27 @@ class MainActivity : AppCompatActivity() {
         )
 
         root.addView(receivedMessage)
+
+        addSpace(root, 10)
+
+        viewSenderMapButton = Button(this)
+        viewSenderMapButton.text = "📍 VIEW SENDER LOCATION ON MAP"
+        viewSenderMapButton.visibility = View.GONE
+        viewSenderMapButton.setOnClickListener {
+            val pkt = latestReceivedPacket
+            if (pkt != null) {
+                val loc = MeshLocationUtils.extractLocation(pkt.message)
+                val intent = Intent(this, OfflineMapActivity::class.java)
+                if (loc != null) {
+                    intent.putExtra("EXTRA_LAT", loc.latitude)
+                    intent.putExtra("EXTRA_LON", loc.longitude)
+                }
+                startActivity(intent)
+            } else {
+                Toast.makeText(this, "No SOS message received yet", Toast.LENGTH_SHORT).show()
+            }
+        }
+        root.addView(viewSenderMapButton)
 
         // =====================================================
         // SET CONTENT
