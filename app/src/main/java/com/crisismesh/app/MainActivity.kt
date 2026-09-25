@@ -28,6 +28,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -415,12 +417,14 @@ class MainActivity : AppCompatActivity() {
         )
 
         root.setBackgroundColor(
-            android.graphics.Color.rgb(
-                10,
-                15,
-                20
-            )
+            Color.parseColor("#0B0B0B")
         )
+
+        ViewCompat.setOnApplyWindowInsetsListener(root) { view, windowInsets ->
+            val insets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.setPadding(insets.left + 32, insets.top + 24, insets.right + 32, insets.bottom + 40)
+            windowInsets
+        }
 
         // =====================================================
         // TITLE
@@ -589,7 +593,10 @@ class MainActivity : AppCompatActivity() {
             Button(this)
 
         locationButton.text =
-            "GET MY LOCATION"
+            "GET LOCATION"
+
+        locationButton.setBackgroundColor(Color.parseColor("#262626"))
+        locationButton.setTextColor(Color.WHITE)
 
         locationButton.setOnClickListener {
 
@@ -725,10 +732,13 @@ class MainActivity : AppCompatActivity() {
             Button(this)
 
         sendSosButton.text =
-            "🚨  SEND SOS"
+            "SEND SOS"
 
         sendSosButton.isEnabled =
             true
+
+        sendSosButton.setBackgroundColor(Color.parseColor("#DC2626"))
+        sendSosButton.setTextColor(Color.WHITE)
 
         sendSosButton.setOnClickListener {
 
@@ -750,7 +760,10 @@ class MainActivity : AppCompatActivity() {
             Button(this)
 
         scanButton.text =
-            "SCAN FOR NEARBY DEVICES"
+            "SCAN PEERS"
+
+        scanButton.setBackgroundColor(Color.parseColor("#262626"))
+        scanButton.setTextColor(Color.WHITE)
 
         scanButton.setOnClickListener {
 
@@ -783,7 +796,10 @@ class MainActivity : AppCompatActivity() {
             Button(this)
 
         viewMapButton.text =
-            "🗺️  VIEW OFFLINE MAP"
+            "OFFLINE MAP"
+
+        viewMapButton.setBackgroundColor(Color.parseColor("#262626"))
+        viewMapButton.setTextColor(Color.WHITE)
 
         viewMapButton.setOnClickListener {
 
@@ -814,10 +830,10 @@ class MainActivity : AppCompatActivity() {
             "LAST RECEIVED EMERGENCY"
 
         receivedTitle.textSize =
-            16f
+            14f
 
         receivedTitle.setTextColor(
-            android.graphics.Color.LTGRAY
+            Color.parseColor("#A3A3A3")
         )
 
         root.addView(receivedTitle)
@@ -834,7 +850,7 @@ class MainActivity : AppCompatActivity() {
             "No SOS messages received yet."
 
         receivedMessage.textSize =
-            17f
+            15f
 
         receivedMessage.setTextColor(
             android.graphics.Color.WHITE
@@ -848,11 +864,7 @@ class MainActivity : AppCompatActivity() {
         )
 
         receivedMessage.setBackgroundColor(
-            android.graphics.Color.rgb(
-                25,
-                32,
-                40
-            )
+            Color.parseColor("#141414")
         )
 
         root.addView(receivedMessage)
@@ -860,7 +872,9 @@ class MainActivity : AppCompatActivity() {
         addSpace(root, 10)
 
         viewSenderMapButton = Button(this)
-        viewSenderMapButton.text = "📍 VIEW SENDER LOCATION ON MAP"
+        viewSenderMapButton.text = "VIEW SENDER LOCATION ON MAP"
+        viewSenderMapButton.setBackgroundColor(Color.parseColor("#262626"))
+        viewSenderMapButton.setTextColor(Color.WHITE)
         viewSenderMapButton.visibility = View.GONE
         viewSenderMapButton.setOnClickListener {
             val pkt = latestReceivedPacket

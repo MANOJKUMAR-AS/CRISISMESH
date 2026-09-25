@@ -95,6 +95,63 @@ class BluetoothManager(
         Handler(Looper.getMainLooper())
 
     // =========================================================
+    // ADAPTIVE RANGE DISCOVERY (PHY ESCALATION)
+    // =========================================================
+
+    private enum class RangePhyState {
+        PHY_1M,
+        PHY_CODED_S2,
+        PHY_CODED_S8
+    }
+
+    private var currentRangeState = RangePhyState.PHY_1M
+    private var scanTimeoutRunnable: Runnable? = null
+
+    private fun isCodedPhySupported(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                bluetoothAdapter?.isLeCodedPhySupported == true
+            } catch (_: Exception) {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    private fun escalateRangeState() {
+        if (!isCodedPhySupported()) {
+            Log.d("CrisisMesh-Range", "[Range] Coded PHY not supported by this device")
+            currentRangeState = RangePhyState.PHY_1M
+            handler.postDelayed({
+                if (pendingMeshPacket != null) {
+                    startRelayScan()
+                }
+            }, RETRY_SCAN_DELAY_MS)
+            return
+        }
+
+        when (currentRangeState) {
+            RangePhyState.PHY_1M -> {
+                currentRangeState = RangePhyState.PHY_CODED_S2
+                Log.d("CrisisMesh-Range", "[Range] Escalating to Coded S=2")
+            }
+            RangePhyState.PHY_CODED_S2 -> {
+                currentRangeState = RangePhyState.PHY_CODED_S8
+                Log.d("CrisisMesh-Range", "[Range] Escalating to Coded S=8")
+            }
+            RangePhyState.PHY_CODED_S8 -> {
+                currentRangeState = RangePhyState.PHY_1M
+                Log.d("CrisisMesh-Range", "[Range] Maximum range reached (S=8), retrying from 1M")
+            }
+        }
+
+        if (pendingMeshPacket != null) {
+            startRelayScan()
+        }
+    }
+
+    // =========================================================
     // GATT SERVER - RECEIVING SIDE
     // =========================================================
 
@@ -779,8 +836,11 @@ class BluetoothManager(
             return
         }
 
+        Log.d("CrisisMesh-Range", "[Range] Starting SOS peer discovery")
+        Log.d("CrisisMesh-Range", "[Range] Current PHY: $currentRangeState")
+
         listener.onStatusChanged(
-            "Searching for next CrisisMesh peer..."
+            "Searching for next CrisisMesh peer ($currentRangeState)..."
         )
 
         startScanInternal(
@@ -849,14 +909,47 @@ class BluetoothManager(
                 )
                 .build()
 
-        val settings =
+        val settingsBuilder =
             ScanSettings.Builder()
                 .setScanMode(
                     ScanSettings.SCAN_MODE_LOW_LATENCY
                 )
-                .build()
+
+        if (isCodedPhySupported()) {
+            when (currentRangeState) {
+                RangePhyState.PHY_1M -> {
+                    Log.d("CrisisMesh-Range", "[Range] Current PHY: 1M")
+                }
+                RangePhyState.PHY_CODED_S2 -> {
+                    Log.d("CrisisMesh-Range", "[Range] Current PHY: Coded S=2")
+                    try {
+                        settingsBuilder.setPhy(ScanSettings.PHY_LE_ALL_SUPPORTED)
+                    } catch (_: Exception) {}
+                }
+                RangePhyState.PHY_CODED_S8 -> {
+                    Log.d("CrisisMesh-Range", "[Range] Current PHY: Coded S=8")
+                    try {
+                        settingsBuilder.setPhy(ScanSettings.PHY_LE_ALL_SUPPORTED)
+                    } catch (_: Exception) {}
+                }
+            }
+        } else if (!isCodedPhySupported() && currentRangeState != RangePhyState.PHY_1M) {
+            Log.d("CrisisMesh-Range", "[Range] Coded PHY not supported by this device")
+            currentRangeState = RangePhyState.PHY_1M
+        }
+
+        val settings = settingsBuilder.build()
 
         scanning = true
+
+        scanTimeoutRunnable = Runnable {
+            if (scanning) {
+                Log.d("CrisisMesh-Range", "[Range] No suitable peer found on $currentRangeState")
+                stopScan()
+                escalateRangeState()
+            }
+        }
+        handler.postDelayed(scanTimeoutRunnable!!, 3500L)
 
         try {
 
@@ -922,7 +1015,11 @@ class BluetoothManager(
                     name
                 )
 
+                Log.d("CrisisMesh-Range", "[Range] Peer discovered: $name")
+
                 stopScan()
+
+                currentRangeState = RangePhyState.PHY_1M
 
                 connectToDevice(device)
             }
@@ -955,6 +1052,8 @@ class BluetoothManager(
 
     @SuppressLint("MissingPermission")
     private fun stopScan() {
+        scanTimeoutRunnable?.let { handler.removeCallbacks(it) }
+        scanTimeoutRunnable = null
 
         if (!scanning) {
             return
@@ -1044,6 +1143,19 @@ class BluetoothManager(
                     status == BluetoothGatt.GATT_SUCCESS &&
                     newState == BluetoothProfile.STATE_CONNECTED
                 ) {
+
+                    if (isCodedPhySupported()) {
+                        val phyOption = when (currentRangeState) {
+                            RangePhyState.PHY_CODED_S2 -> BluetoothDevice.PHY_OPTION_S2
+                            RangePhyState.PHY_CODED_S8 -> BluetoothDevice.PHY_OPTION_S8
+                            else -> BluetoothDevice.PHY_OPTION_NO_PREFERRED
+                        }
+                        if (phyOption != BluetoothDevice.PHY_OPTION_NO_PREFERRED) {
+                            try {
+                                gatt.setPreferredPhy(BluetoothDevice.PHY_LE_CODED_MASK, BluetoothDevice.PHY_LE_CODED_MASK, phyOption)
+                            } catch (_: Exception) {}
+                        }
+                    }
 
                     listener.onStatusChanged(
                         "Connected — discovering CrisisMesh service..."
@@ -1222,6 +1334,10 @@ class BluetoothManager(
 
                     clearOutgoingState()
 
+                    Log.d("CrisisMesh-Range", "[Range] SOS transmission acknowledged")
+                    Log.d("CrisisMesh-Range", "[Range] Returning to normal discovery state")
+                    currentRangeState = RangePhyState.PHY_1M
+
                     listener.onStatusChanged(
                         "SOS transmitted successfully"
                     )
@@ -1298,6 +1414,7 @@ class BluetoothManager(
     private fun sendMeshPacket(
         meshMessage: String
     ) {
+        Log.d("CrisisMesh-Range", "[Range] SOS transmission started")
 
         val gatt =
             bluetoothGatt
